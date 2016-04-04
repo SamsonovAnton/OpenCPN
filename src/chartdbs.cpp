@@ -60,6 +60,49 @@ bool FindMatchingFile(const wxString &theDir, const wxChar *theRegEx, int nameLe
     return false;
 }
 
+#if defined(__WINDOWS__) || defined(__CYGWIN__)
+#define USE_GETFILEMAGIC_WORKAROUND
+#include <windows.h>
+// From wxWidgets::wxFileName private functions.
+// Convert between wxDateTime and FILETIME which is a 64-bit value representing
+// the number of 100-nanosecond intervals since January 1, 1601 UTC.
+// This is the offset between FILETIME epoch and the Unix/wxDateTime Epoch.
+static wxInt64 EPOCH_OFFSET_IN_MSEC = wxLL(11644473600000);
+static void ConvertFileTimeToWx(wxDateTime *dt, const FILETIME &ft)
+{
+    wxLongLong t(ft.dwHighDateTime, ft.dwLowDateTime);
+    t /= 10000; // Convert hundreds of nanoseconds to milliseconds.
+    t -= EPOCH_OFFSET_IN_MSEC;
+    *dt = wxDateTime(t);
+}
+#endif
+
+bool GetFileMagic(const wxFileName &file, wxULongLong &size, wxDateTime &time)
+{
+#if !defined(USE_GETFILEMAGIC_WORKAROUND)
+    size = file.GetSize();
+    if(size == wxInvalidSize) return false;
+    time = file.GetModificationTime();
+#else
+    // This workaround is needed as long as wxFileName on Windows implements its ::GetSize and ::GetTimes
+    // by calling GetFileSize and GetFileTime, as the latter work with file handles instead of names,
+    // thus triggering file open and close actions, which in turn trigger update of last-accessed-time attribute,
+    // resulting in heavy disk load and poor performance on a rather simple directory scan.
+    // If (when) that issue is fixed in wxWidgets, this workaround should be retained for backwards compatibility
+    // by adding corresponding condition to the straight-through branch.
+    WIN32_FILE_ATTRIBUTE_DATA attribs;
+    BOOL success = GetFileAttributesEx(file.GetFullPath().t_str(), GetFileExInfoStandard, &attribs);
+    if(!success) return false;
+    size = wxULongLong(attribs.nFileSizeHigh, attribs.nFileSizeLow);
+    ConvertFileTimeToWx(&time, attribs.ftLastWriteTime);
+#endif
+    return true;
+}
+
+bool GetFileMagic(const wxFileName &file, wxDateTime &time) {
+    wxULongLong size;
+    return GetFileMagic(file, size, time);
+}
 
 ChartFamilyEnum GetChartFamily(int charttype)
 {
@@ -167,8 +210,9 @@ ChartTableEntry::ChartTableEntry(ChartBase &theChart)
           edition_date = theChart.GetEditionDate().GetTicks();
 
     wxFileName fn(theChart.GetFullPath());
-    if(fn.GetModificationTime().IsValid())
-          file_date = fn.GetModificationTime().GetTicks();
+    wxDateTime file_datetime;
+    if (GetFileMagic(fn, file_datetime))
+        file_date = file_datetime.GetTicks();
 
     m_pfilename = new wxString;           // create and populate helper members
     *m_pfilename = fn.GetFullName();
@@ -1579,7 +1623,7 @@ bool ChartDatabase::DetectDirChange(const wxString & dir_path, const wxString & 
       //    Arbitrarily, we decide if the dir has more than a specified number of files
       //    then don't scan it.  Takes too long....
 
-      if(n_files > 10000)
+      if(n_files > 100000)
       {
             new_magic = _T("");
             return true;
@@ -1593,14 +1637,11 @@ bool ChartDatabase::DetectDirChange(const wxString & dir_path, const wxString & 
 
             wxFileName file(FileList.Item(ifile));
 
-            //    File Size;
-            wxULongLong size = file.GetSize();
-            if(wxInvalidSize != size)
-                  nacc = nacc + size;
-
-            //    Mod time, in ticks
-            wxDateTime t = file.GetModificationTime();
-            nacc += t.GetTicks();
+            
+            wxULongLong size;   //    File size;
+            wxDateTime t;       //    File modification time, in ticks
+            if (!GetFileMagic(file, size, t)) continue;
+            nacc += size + t.GetTicks();
 
             //    File name
             wxString n = file.GetFullName();
@@ -1944,7 +1985,17 @@ int ChartDatabase::SearchDirAndAddCharts(wxString& dir_name_base,
 
                         //    Check the file modification time
                         time_t t_oldFile = active_chartTable[isearch].GetFileTime();
-                        time_t t_newFile = file.GetModificationTime().GetTicks();
+                        time_t t_newFile;
+                        wxDateTime dt_newFile;
+                        if(GetFileMagic(file, dt_newFile)) {
+                            t_newFile = dt_newFile.GetTicks();
+                        } else {
+                            wxString msg = _T("   Having trouble getting file time: ");
+                            msg.Append(full_name);
+                            wxLogMessage(msg);
+                            t_newFile = t_oldFile;
+                        }
+
                         
                         if( t_newFile <= t_oldFile )
                         {
